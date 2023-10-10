@@ -732,6 +732,8 @@ ACTOR Future<Void> preresolutionProcessing(CommitBatchContext* self) {
 
 	// Pre-resolution the commits
 	TEST(pProxyCommitData->latestLocalCommitBatchResolving.get() < localBatchNumber - 1); // Wait for local batch
+	// Ensuring monotony of commit version numbers for commit batches
+	// wait for the previous batch to have got a commit version and to start resolving
 	wait(pProxyCommitData->latestLocalCommitBatchResolving.whenAtLeast(localBatchNumber - 1));
 	pProxyCommitData->stats.computeLatency.addMeasurement(now() - timeStart);
 	double queuingDelay = g_network->now() - timeStart;
