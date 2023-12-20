@@ -79,6 +79,11 @@ if(WIN32)
   add_definitions(-D_USE_MATH_DEFINES) # Math constants
 endif()
 
+if(APPLE)
+# Remove this after boost 1.81 or above is used
+add_definitions(-D_LIBCPP_ENABLE_CXX17_REMOVED_UNARY_BINARY_FUNCTION)
+endif()
+
 if (USE_CCACHE)
   find_program(CCACHE_PROGRAM "ccache" REQUIRED)
   set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
@@ -279,6 +284,7 @@ else()
       $<${is_cxx_compile}:-DBOOST_USE_UCONTEXT>
     )
     list(APPEND SANITIZER_LINK_OPTIONS $<${is_cxx_link}:-fsanitize=thread>)
+
     list(APPEND BOOST_CXX_OPTIONS
       -fsanitize=thread
       -DBOOST_USE_UCONTEXT

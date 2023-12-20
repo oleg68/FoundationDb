@@ -309,6 +309,50 @@ public:
 		}
 	}
 
+	ACTOR static Future<Void> monitorHotShards(Ratekeeper* self, Reference<AsyncVar<ServerDBInfo> const> dbInfo) {
+		loop {
+			wait(delay(SERVER_KNOBS->HOT_SHARD_MONITOR_FREQUENCY));
+			if (!self->ssHighWriteQueue.present()) {
+				continue;
+			}
+
+			state UID ssi = self->ssHighWriteQueue.get();
+			state SetThrottledShardRequest setReq;
+
+			// TraceEvent(SevDebug, "SendGetHotShardsRequest");
+			try {
+				GetHotShardsRequest getReq;
+				GetHotShardsReply reply = wait(self->storageServerInterfaces[ssi].getHotShards.getReply(getReq));
+
+				// Backup's restore range can't be throttled, otherwise restore would fail,
+				// i.e., "ApplyMutationsError".
+				KeyRangeRef applyMutationRange("\xfe\xff\xfe"_sr, "\xfe\xff\xff\xff"_sr);
+				for (const auto& shard : reply.hotShards) {
+					if (!shard.intersects(applyMutationRange)) {
+						setReq.throttledShards.push_back(shard);
+					} else {
+						TraceEvent("IgnoreHotShard").detail("Shard", shard);
+					}
+				}
+			} catch (Error& e) {
+				TraceEvent(SevWarn, "CannotMonitorHotShardForSS").detail("SS", ssi);
+				continue;
+			}
+			if (!setReq.throttledShards.size()) {
+				continue;
+			}
+			setReq.expirationTime = now() + SERVER_KNOBS->HOT_SHARD_THROTTLING_EXPIRE_AFTER;
+			for (auto& shard : setReq.throttledShards) {
+				TraceEvent(SevInfo, "SendRequestThrottleHotShard")
+				    .detail("Shard", shard)
+				    .detail("DelayUntil", setReq.expirationTime);
+			}
+			for (const auto& cpi : dbInfo->get().client.commitProxies) {
+				cpi.setThrottledShard.send(setReq);
+			}
+		}
+	}
+
 	ACTOR static Future<Void> monitorBlobWorkers(Ratekeeper* self, Reference<AsyncVar<ServerDBInfo> const> dbInfo) {
 		state std::vector<BlobWorkerInterface> blobWorkers;
 		state int workerFetchCount = 0;
@@ -430,6 +474,11 @@ public:
 		if (SERVER_KNOBS->BW_THROTTLING_ENABLED) {
 			self.addActor.send(self.monitorBlobWorkers(dbInfo));
 		}
+
+		if (SERVER_KNOBS->HOT_SHARD_THROTTLING_ENABLED) {
+			self.addActor.send(self.monitorHotShards(dbInfo));
+		}
+
 		self.addActor.send(self.refreshStorageServerCommitCosts());
 
 		TraceEvent("RkTLogQueueSizeParameters", rkInterf.id())
@@ -596,6 +645,11 @@ public:
 					self.updateCommitCostEstimation(req.ssTrTagCommitCost);
 					req.reply.send(Void());
 				}
+				when(GetSSVersionLagRequest req = waitNext(rkInterf.getSSVersionLag.getFuture())) {
+					GetSSVersionLagReply reply;
+					self.getSSVersionLag(reply.maxPrimarySSVersion, reply.maxRemoteSSVersion);
+					req.reply.send(reply);
+				}
 				when(wait(err.getFuture())) {}
 				when(wait(dbInfo->onChange())) {
 					if (!recovering && dbInfo->get().recoveryState < RecoveryState::ACCEPTING_COMMITS) {
@@ -676,6 +730,10 @@ Future<Void> Ratekeeper::monitorThrottlingChanges() {
 	return tagThrottler->monitorThrottlingChanges();
 }
 
+Future<Void> Ratekeeper::monitorHotShards(Reference<AsyncVar<ServerDBInfo> const> dbInfo) {
+	return RatekeeperImpl::monitorHotShards(this, dbInfo);
+}
+
 Future<Void> Ratekeeper::monitorBlobWorkers(Reference<AsyncVar<ServerDBInfo> const> dbInfo) {
 	return RatekeeperImpl::monitorBlobWorkers(this, dbInfo);
 }
@@ -727,6 +785,20 @@ void Ratekeeper::updateCommitCostEstimation(
 	}
 }
 
+static std::string getIgnoredZonesReasons(
+    std::set<Optional<Standalone<StringRef>>>& ignoredMachines,
+    std::map<Optional<Standalone<StringRef>>, std::set<limitReason_t>>& zoneReasons) {
+	std::string ignoredZoneReasons;
+	for (auto zone : ignoredMachines) {
+		ignoredZoneReasons += zone.get().toString() + " [";
+		for (auto reason : zoneReasons[zone]) {
+			ignoredZoneReasons += std::to_string(reason) + " ";
+		}
+		ignoredZoneReasons += "] ";
+	}
+	return ignoredZoneReasons.length() ? ignoredZoneReasons : "None";
+}
+
 void Ratekeeper::updateRate(RatekeeperLimits* limits) {
 	// double controlFactor = ;  // dt / eFoldingTime
 
@@ -752,6 +824,7 @@ void Ratekeeper::updateRate(RatekeeperLimits* limits) {
 	std::multimap<int64_t, StorageQueueInfo const*> storageDurabilityLagReverseIndex;
 
 	std::map<UID, limitReason_t> ssReasons;
+	std::map<Optional<Standalone<StringRef>>, std::set<limitReason_t>> zoneReasons;
 
 	bool printRateKeepLimitReasonDetails =
 	    SERVER_KNOBS->RATEKEEPER_PRINT_LIMIT_REASON &&
@@ -895,6 +968,7 @@ void Ratekeeper::updateRate(RatekeeperLimits* limits) {
 		}
 
 		ssReasons[ss.id] = ssLimitReason;
+		zoneReasons[ss.locality.zoneId()].insert(ssLimitReason);
 	}
 
 	tagThrottler->updateThrottling(storageQueueInfo);
@@ -1336,6 +1410,7 @@ void Ratekeeper::updateRate(RatekeeperLimits* limits) {
 		    .detail("LimitingStorageServerVersionLag", limitingVersionLag)
 		    .detail("WorstStorageServerDurabilityLag", worstDurabilityLag)
 		    .detail("LimitingStorageServerDurabilityLag", limitingDurabilityLag)
+		    .detail("IgnoredZonesReasons", getIgnoredZonesReasons(ignoredMachines, zoneReasons))
 		    .detail("TagsAutoThrottled", tagThrottler->autoThrottleCount())
 		    .detail("TagsAutoThrottledBusyRead", tagThrottler->busyReadTagCount())
 		    .detail("TagsAutoThrottledBusyWrite", tagThrottler->busyWriteTagCount())
@@ -1343,10 +1418,29 @@ void Ratekeeper::updateRate(RatekeeperLimits* limits) {
 		    .detail("AutoThrottlingEnabled", tagThrottler->isAutoThrottlingEnabled())
 		    .trackLatest(name);
 	}
+	ssHighWriteQueue.reset();
+	if (limitReason == limitReason_t::storage_server_write_queue_size) {
+		ssHighWriteQueue = reasonID;
+	}
 }
 
 Future<Void> Ratekeeper::refreshStorageServerCommitCosts() {
 	return RatekeeperImpl::refreshStorageServerCommitCosts(this);
+}
+
+void Ratekeeper::getSSVersionLag(Version& maxSSPrimaryVersion, Version& maxSSRemoteVersion) {
+	maxSSPrimaryVersion = maxSSRemoteVersion = invalidVersion;
+	for (auto i = storageQueueInfo.begin(); i != storageQueueInfo.end(); ++i) {
+		auto const& ss = i->value;
+		if (!ss.valid || !ss.acceptingRequests)
+			continue;
+
+		if (remoteDC.present() && ss.locality.dcId() == remoteDC) {
+			maxSSRemoteVersion = std::max(ss.getLatestVersion(), maxSSRemoteVersion);
+		} else {
+			maxSSPrimaryVersion = std::max(ss.getLatestVersion(), maxSSPrimaryVersion);
+		}
+	}
 }
 
 ACTOR Future<Void> ratekeeper(RatekeeperInterface rkInterf, Reference<AsyncVar<ServerDBInfo> const> dbInfo) {
@@ -1403,20 +1497,31 @@ UpdateCommitCostRequest StorageQueueInfo::refreshCommitCost(double elapsed) {
 	busiestWriteTags.clear();
 	TransactionTag busiestTag;
 	TransactionCommitCostEstimation maxCost;
-	double maxRate = 0, maxBusyness = 0;
+	double maxRate = 0;
+	std::priority_queue<BusyTagInfo, std::vector<BusyTagInfo>, std::greater<BusyTagInfo>> topKWriters;
 	for (const auto& [tag, cost] : tagCostEst) {
 		double rate = cost.getCostSum() / elapsed;
+		double busyness = static_cast<double>(maxCost.getCostSum()) / totalWriteCosts;
+		if (rate < SERVER_KNOBS->MIN_TAG_WRITE_PAGES_RATE * CLIENT_KNOBS->TAG_THROTTLING_PAGE_SIZE) {
+			continue;
+		}
+		if (topKWriters.size() < SERVER_KNOBS->SS_THROTTLE_TAGS_TRACKED) {
+			topKWriters.emplace(tag, rate, busyness);
+		} else if (topKWriters.top().rate < rate) {
+			topKWriters.pop();
+			topKWriters.emplace(tag, rate, busyness);
+		}
+
 		if (rate > maxRate) {
 			busiestTag = tag;
 			maxRate = rate;
 			maxCost = cost;
 		}
 	}
-	if (maxRate > SERVER_KNOBS->MIN_TAG_WRITE_PAGES_RATE * CLIENT_KNOBS->TAG_THROTTLING_PAGE_SIZE) {
-		// TraceEvent("RefreshSSCommitCost").detail("TotalWriteCost", totalWriteCost).detail("TotalWriteOps",totalWriteOps);
-		ASSERT_GT(totalWriteCosts, 0);
-		maxBusyness = double(maxCost.getCostSum()) / totalWriteCosts;
-		busiestWriteTags.emplace_back(busiestTag, maxRate, maxBusyness);
+
+	while (!topKWriters.empty()) {
+		busiestWriteTags.push_back(std::move(topKWriters.top()));
+		topKWriters.pop();
 	}
 
 	UpdateCommitCostRequest updateCommitCostRequest{ ratekeeperID,
